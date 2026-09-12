@@ -47,7 +47,6 @@ class CtrlIdx(StrEnum):
     NB_CTL_TAIL_LIGHT = "Tail light on"
     NB_SINGLE_MIL = "Single mileage"
     NB_SINGLE_RUN_TIM = "Single operation time"
-    NB_POWER = "Scooter power"
 
 
 class BmsIdx(StrEnum):
@@ -287,13 +286,6 @@ _CTRL_TABLE: dict[CtrlIdx, RegDesc[Any]] = {
         scaler=lambda x: round(x / 3600, 1),
         device_class=SensorDeviceClass.DURATION,
         unit=Units.TIME_HOURS,
-    ),
-    CtrlIdx.NB_POWER: RegDesc(
-        0xBA,
-        1,
-        2,
-        _unpack_LE16,
-        unit=Units.POWER_WATT,
     ),
 }
 

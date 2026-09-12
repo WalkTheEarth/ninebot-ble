@@ -32,7 +32,6 @@ class NinebotBleSensor(BluetoothData):
 
     async def async_poll(self, device: BLEDevice) -> SensorUpdate:
         """Poll all data from Scooter."""
-        print("Connected:", self.client.is_connected)
         if not self.client.is_connected or self.device is None or self.device != device:
             await self.client.disconnect()
             self.client = NinebotClient()
@@ -44,11 +43,13 @@ class NinebotBleSensor(BluetoothData):
             parsed_sn = SerialParser(serial)
             self.set_title(str(parsed_sn))
             self.set_device_type(str(parsed_sn))
-            self.set_device_hw_version(
-                f"Rev {parsed_sn.product_revision}, {parsed_sn.production_date.year}/{parsed_sn.production_date.month}"
-            )
+            if parsed_sn.product_revision is not None:
+                self.set_device_hw_version(
+                    f"Rev {parsed_sn.product_revision}, "
+                    f"{parsed_sn.production_date.year}/{parsed_sn.production_date.month:02d}"
+                )
         except ValueError as e:
-            _LOGGER.warn("Failed to parse scooter serial number: %s", e)
+            _LOGGER.warning("Failed to parse scooter serial number: %s", e)
             self.set_title(device.name or device.address)
             self.set_device_type("Ninebot scooter")
 
@@ -57,7 +58,11 @@ class NinebotBleSensor(BluetoothData):
 
         for idx in iter_register(CtrlIdx, BmsIdx):
             entry = get_register_desc(idx)
-            val = await self.client.read_reg(idx)
+            try:
+                val = await self.client.read_reg(idx)
+            except Exception as err:  # noqa: BLE001 - one stubborn register must not kill the poll
+                _LOGGER.debug("Could not read register %s: %s", idx, err)
+                continue
             if isinstance(val, enum.Enum):
                 val = val.name
             self.update_sensor(str(idx), entry.unit, val, entry.device_class, str(idx))

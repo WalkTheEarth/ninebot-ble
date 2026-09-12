@@ -22,6 +22,8 @@ _LOGGER = logging.getLogger(__name__)
 NORDIC_UART_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NORDIC_UART_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
+INIT_ACK_PAYLOAD_LEN = 24  # 16-byte BLE key + serial
+
 
 class Command(enum.Enum):
     READ = 0x01
@@ -38,6 +40,14 @@ class Command(enum.Enum):
     PING = 0x5C
     PAIR = 0x5D
 
+    @classmethod
+    def from_maybe(cls, value: int) -> Command | None:
+        """Return the Command for value, or None if it is not a known command."""
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
 
 class DeviceId(enum.Enum):
     ES_CONTROL = 0x20
@@ -50,6 +60,17 @@ class DeviceId(enum.Enum):
     """PC upper computer connected through serial port/CAN debugger/IoT equipment"""
     PHONE = 0x3E
     """Mobile phone linked through Bluetooth serial port (BLE)"""
+
+    @classmethod
+    def from_maybe(cls, value: int) -> DeviceId | None:
+        """Return the DeviceId for value, or None if it is not a known id.
+
+        Some models and firmwares use device ids that are not in the list above.
+        """
+        try:
+            return cls(value)
+        except ValueError:
+            return None
 
 
 class Packet:
@@ -78,6 +99,7 @@ class Packet:
 
     @staticmethod
     def unpack(data: bytearray) -> Packet | None:
+        """Unpack a frame, raising on unknown device ids or commands."""
         if len(data) < 7 or list(data[:2]) != Packet.MAGIC:
             return None
         segment_len = data[2]
@@ -85,14 +107,63 @@ class Packet:
             return None
         return Packet(DeviceId(data[3]), DeviceId(data[4]), Command(data[5]), data[6], list(data[7:]))
 
-    def __str__(self) -> str:
-        ds = ""
-        if len(self.data_segment) > 0:
-            ds = ", data=" + hexlify(bytes(self.data_segment)).upper().decode()
-        return (
-            f"Packet[{self.source.name} -> {self.target.name},"
-            f" cmd={self.command.name}, idx={self.data_index:02X}{ds}]"
-        )
+    @staticmethod
+    def unpack_safe(data: bytearray) -> Packet | None:
+        """Unpack a frame, returning None on malformed or unknown content.
+
+        Unlike unpack() this never raises: scooters of different models and
+        firmware generations send device ids and commands we do not know about,
+        and those frames should be skipped instead of crashing the client.
+        """
+        if len(data) < 7 or list(data[:2]) != Packet.MAGIC:
+            return None
+        segment_len = data[2]
+        if len(data) < 7 + segment_len:
+            return None
+        source = DeviceId.from_maybe(data[3])
+        target = DeviceId.from_maybe(data[4])
+        command = Command.from_maybe(data[5])
+        if source is None or target is None or command is None:
+            _LOGGER.debug("Skipping frame with unknown ids: %s", hexlify(bytes(data)).upper().decode())
+            return None
+        return Packet(source, target, command, data[6], list(data[7:]))
+
+
+class LegacyCodec:
+    """Plain (unencrypted) variant of the 0x5A 0xA5 protocol.
+
+    Older scooter firmwares (early ES-series and friends) do not support the
+    encrypted protocol; they exchange plain frames protected only by a 16-bit
+    inverted-sum checksum appended after the payload.
+    """
+
+    @staticmethod
+    def sum16(data: bytes | bytearray) -> int:
+        """The legacy checksum: inverted 16-bit sum of all covered bytes."""
+        return (~sum(data)) & 0xFFFF
+
+    @classmethod
+    def checksum_ok(cls, frame: bytearray) -> bool:
+        if len(frame) < 9:
+            return False
+        expected = cls.sum16(frame[2:-2])
+        actual = frame[-2] | (frame[-1] << 8)
+        return expected == actual
+
+    @classmethod
+    def decrypt(cls, frame: bytearray) -> bytes:
+        """Legacy frames are plain; just drop the checksum trailer."""
+        return bytes(frame[:-2])
+
+    @classmethod
+    def encrypt(cls, payload: bytearray) -> bytes:
+        checksum = cls.sum16(payload[2:])
+        return bytes(payload) + bytes([checksum & 0xFF, (checksum >> 8) & 0xFF])
+
+    @classmethod
+    def is_legacy_frame(cls, frame: bytearray) -> bool:
+        """True if frame looks like a legacy plain frame with valid checksum."""
+        return cls.checksum_ok(frame)
 
 
 class NinebotClient:
@@ -103,6 +174,10 @@ class NinebotClient:
         self.receive_queue: asyncio.Queue[Packet] = asyncio.Queue(100)
         self.receive_buffer = bytearray()
         self.client: BleakClient | None = None
+        # None until the handshake tells us which protocol the scooter speaks.
+        self.legacy: bool | None = None
+        # Per-instance key so that two clients (e.g. two scooters) never share one.
+        self.app_key = self.APP_KEY
 
     async def connect(self, device: BLEDevice) -> None:
         """Connect and handshake the scooter.
@@ -117,20 +192,41 @@ class NinebotClient:
 
         _LOGGER.debug("Authenticating ...")
 
-        # Init
-        resp = await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.INIT, 0))
+        # Probe which protocol generation the scooter speaks: old firmwares
+        # only understand plain frames (2-byte checksum trailer) and ignore
+        # encrypted ones, so try plain first and fall back to encrypted.
+        init_packet = Packet(DeviceId.PC, DeviceId.ES_BLE, Command.INIT, 0)
+        try:
+            self.legacy = True
+            resp = await self.request(init_packet, timeout=3)
+        except (TimeoutError, asyncio.TimeoutError):
+            self.legacy = False
+            try:
+                resp = await self.request(init_packet, timeout=5)
+            except (TimeoutError, asyncio.TimeoutError):
+                await self.disconnect()
+                raise
         received_key = resp.data_segment[:16]
         received_serial = resp.data_segment[16:]
 
+        _LOGGER.debug("> Protocol: %s", "legacy plain" if self.legacy else "encrypted")
         _LOGGER.debug("> BLE Key: %s", hexlify(bytes(received_key)).upper().decode())
-        _LOGGER.debug("> Serial: %s", bytes(received_serial).decode())
-        self.crypto.set_ble_data(received_key)
+        _LOGGER.debug("> Serial: %s", bytes(received_serial).decode(errors="replace"))
+        if not self.legacy:
+            self.crypto.set_ble_data(received_key)
+
+        if self.legacy:
+            # Old firmwares only know the plain protocol; pair without crypto.
+            await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
+            _LOGGER.debug("Connected successfully (legacy protocol)!")
+            return
 
         # Ping
-        resp = await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PING, 0, self.APP_KEY))
+        resp = await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PING, 0, self.app_key))
         if resp.data_index == 0:
             # Zero (0) indicates we are not paired yet.
-            while True:
+            resp = None
+            while resp is None:
                 await asyncio.sleep(1.0)
                 # Sending pair request here seem to pair the device. Unclear why.
                 await self.send(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
@@ -138,13 +234,16 @@ class NinebotClient:
                     resp = await self.receive()
                 except TimeoutError:
                     pass
+                if resp is None:
+                    # If we get here, the button on the scooter need to be pressed.
+                    _LOGGER.info("Please press power button on scooter!")
+                    continue
                 if resp.command == Command.PING and resp.data_index == 1:
-                    self.crypto.set_app_data(self.APP_KEY)
+                    self.crypto.set_app_data(self.app_key)
                     break
                 if resp.command == Command.PAIR and resp.data_index == 1:
                     break
-                # If we get here, the button on the scooter need to be pressed.
-                _LOGGER.info("Please press power button on scooter!")
+                resp = None
 
         # Pair
         await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
@@ -153,16 +252,33 @@ class NinebotClient:
 
     async def disconnect(self) -> None:
         if self.client and self.client.is_connected:
-            await self.client.stop_notify(NORDIC_UART_TX_UUID)
+            try:
+                await self.client.stop_notify(NORDIC_UART_TX_UUID)
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
             await self.client.disconnect()
-            self.client = None
+        self.client = None
+
+    def _encrypt(self, payload: bytearray) -> bytes:
+        if self.legacy:
+            return LegacyCodec.encrypt(payload)
+        return self.crypto.encrypt(payload)
+
+    def _decrypt(self, frame: bytearray) -> bytes:
+        if self.legacy is None:
+            # Auto-detect the protocol from the first response frame.
+            self.legacy = LegacyCodec.is_legacy_frame(frame)
+            _LOGGER.debug("Scooter speaks the %s protocol", "legacy plain" if self.legacy else "encrypted")
+        if self.legacy:
+            return LegacyCodec.decrypt(frame)
+        return self.crypto.decrypt(frame)
 
     @retry_bluetooth_connection_error()
     async def send(self, packet: Packet) -> None:
         """Send a BLE-UART packet to scooter."""
         assert self.client is not None, "Must be connected first."
         _LOGGER.debug("Sending %s", packet)
-        msg = self.crypto.encrypt(packet.pack())
+        msg = self._encrypt(packet.pack())
         msg_len = len(msg)
         byte_idx = 0
         while msg_len > 0:
@@ -202,6 +318,10 @@ class NinebotClient:
 
                 while time.time() < deadline:
                     recv_packet = await self.receive()
+                    if recv_packet.command not in command_replies.values() and recv_packet.command != request.command:
+                        # e.g. a stray notification; ignore frames we cannot match
+                        if request.command not in (Command.INIT, Command.PING, Command.PAIR):
+                            continue
                     if (
                         recv_packet.source == request.target
                         and recv_packet.target == request.source
@@ -237,24 +357,54 @@ class NinebotClient:
         return unpacked
 
     async def _read_callback(self, _: BleakGATTCharacteristic, data: bytearray) -> None:
-        if list(data[:2]) == Packet.MAGIC:
-            self.receive_buffer = data
+        try:
+            await self._handle_received(data)
+        except Exception:  # noqa: BLE001 - never let the callback crash the connection
+            _LOGGER.exception("Error while processing received BLE data")
+
+    async def _handle_received(self, data: bytearray) -> None:
+        # A frame starts with the 0x5A 0xA5 magic. Notifications can contain a
+        # whole frame, a fragment, or (on some adapters) several concatenated
+        # frames, so re-sync on 0xA5 instead of blindly appending.
+        if len(data) >= 2 and list(data[:2]) == Packet.MAGIC:
+            self.receive_buffer = bytearray(data)
+        elif len(self.receive_buffer) == 1 and self.receive_buffer[0] == Packet.MAGIC[0] and data[:1] == b"\xa5":
+            # The previous notification ended with a lone 0x5A; this one starts
+            # with the second magic byte 0xA5.
+            self.receive_buffer += data[1:]
         else:
             self.receive_buffer += data
 
-        decrypted = self.crypto.decrypt(self.receive_buffer)
+        if len(self.receive_buffer) < 3:
+            return
+
+        decrypted = self._decrypt(self.receive_buffer)
         total_len = self.receive_buffer[2] + 7
         _LOGGER.debug(f"Decrypted {len(decrypted)}/{total_len}: {hexlify(decrypted).upper().decode()}")
+
         if len(decrypted) == total_len:
-            packet = Packet.unpack(decrypted)
+            self.receive_buffer = bytearray()
+            packet = Packet.unpack_safe(decrypted)
             if packet is None:
                 _LOGGER.warning("Failed to decode received packet")
+                return
+            # Drop stale packets when the queue backed up, so a poll never
+            # reads a reply belonging to an earlier request.
+            if self.receive_queue.full():
+                try:
+                    self.receive_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await self.receive_queue.put(packet)
+        elif len(decrypted) > total_len:
+            # Several frames may arrive concatenated; re-sync on the next one.
+            resync = decrypted.find(b"\xa5", 2)
+            if resync != -1 and resync + 1 < len(self.receive_buffer):
+                self.receive_buffer = self.receive_buffer[resync - 1 :]
             else:
-                await self.receive_queue.put(packet)
-        elif len(decrypted) >= total_len:
-            self.receive_buffer = bytearray()
-            _LOGGER.warning(
-                "Malformed packet received, expected packet size %d bytes, received %d bytes",
-                total_len,
-                len(decrypted),
-            )
+                self.receive_buffer = bytearray()
+                _LOGGER.warning(
+                    "Malformed packet received, expected packet size %d bytes, received %d bytes",
+                    total_len,
+                    len(decrypted),
+                )
