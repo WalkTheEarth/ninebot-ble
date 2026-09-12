@@ -25,10 +25,10 @@ but will work for more use-cases as well.
 
 ## Installation
 
-From PyPI:
+From PyPI (published as `ninebot-bleNG` — the importable module stays `ninebot_ble`):
 
 ```
-pip install ninebot-ble
+pip install ninebot-bleNG
 ```
 
 Or straight from GitHub for the latest changes:

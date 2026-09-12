@@ -1,5 +1,5 @@
 [project]
-name = "ninebot-ble"
+name = "ninebot-bleNG"
 version = "0.1.2"
 authors = [
   { name="ownbee" },
