@@ -222,35 +222,46 @@ class NinebotClient:
             _LOGGER.debug("Connected successfully (legacy protocol)!")
             return
 
-        # Ping
+        # Ping. The reply tells us whether the scooter already accepts this
+        # session (data_index 1) or waits for a button-press pairing confirm
+        # (data_index 0). Mirrors miauth's state machine.
         resp = await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PING, 0, self.app_key))
-        if resp.data_index == 0:
-            # Zero (0) indicates we are not paired yet. The scooter stays in
-            # this state until the user presses its power button.
+        need_final_pair = False
+        if resp.command == Command.PING and resp.data_index == 1:
+            # Already paired: switch both sides to the app-key derived crypto
+            # and finish with a PAIR exchange, as miauth does.
+            self.crypto.set_app_data(self.app_key)
+            need_final_pair = True
+        else:
+            # Not paired yet: the scooter stays in this state until the user
+            # presses its power button. Keep sending PAIR (as miauth does) and
+            # wait for the confirmation. Two confirmation styles exist in the
+            # wild: a fresh PING ack with data_index 1 (then both sides switch
+            # to the app key and a final PAIR exchange is needed), or a PAIR
+            # ack with data_index 1 (then the session simply continues on the
+            # BLE key and no further PAIR must be sent).
             _LOGGER.info(
                 "Scooter is not paired yet: press the power button on the "
                 "scooter once to confirm pairing (waiting up to %d s) ...",
                 int(PAIRING_TIMEOUT),
             )
-            resp = None
             deadline = time.time() + PAIRING_TIMEOUT
-            while resp is None and time.time() < deadline:
-                await asyncio.sleep(1.0)
-                # Sending pair request here seem to pair the device. Unclear why.
+            confirmed = False
+            while time.time() < deadline:
                 await self.send(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
                 try:
-                    resp = await self.receive()
+                    r = await self.receive()
                 except TimeoutError:
-                    pass
-                if resp is None:
                     continue
-                if resp.command == Command.PING and resp.data_index == 1:
+                if r.command == Command.PING and r.data_index == 1:
                     self.crypto.set_app_data(self.app_key)
+                    need_final_pair = True
+                    confirmed = True
                     break
-                if resp.command == Command.PAIR and resp.data_index == 1:
+                if r.command == Command.PAIR and r.data_index == 1:
+                    confirmed = True
                     break
-                resp = None
-            if resp is None:
+            if not confirmed:
                 await self.disconnect()
                 raise TimeoutError(
                     "Scooter did not confirm pairing within "
@@ -258,8 +269,11 @@ class NinebotClient:
                     "scooter once right after connecting and try again."
                 )
 
-        # Pair
-        await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
+        if need_final_pair:
+            # Final PAIR, now with matching session keys on both sides. A
+            # scooter that confirmed via PAIR ack ignores further PAIR
+            # requests, so only send this in the PING-ack flow.
+            await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
 
         _LOGGER.debug("Connected and authenticated successfully!")
 

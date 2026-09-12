@@ -183,6 +183,13 @@ class FakeBleakClient:
         self.writes: list[bytes] = []
         self.notify_callback: Any = None
         self.legacy = False
+        # How the scooter confirms a button-press pairing: "pair" answers the
+        # PAIR request with PAIR-1 and keeps the BLE key; "ping" spontaneously
+        # sends a fresh PING-1 and both sides switch to the app key.
+        self.confirm_style = "pair"
+        # Number of PAIR requests received before the "button press" happens.
+        self.button_after: int | None = None
+        self.pair_requests = 0
 
     async def start_notify(self, uuid: str, callback: Any) -> None:
         self.notify_callback = callback
@@ -243,18 +250,39 @@ class FakeBleakClient:
             else:
                 wire = self._crypto.encrypt(resp_frame)
             if idx == 1:
-                # Already-paired scooter: both sides keep the BLE key
-                # (mirrors the client, which only derives the app key during
-                # the unpaired press-button dance).
-                pass
+                # Already-paired scooter: from now on both sides derive the
+                # session keys from the app key.
+                self._crypto.set_app_data(self._app_key)
         elif packet.command == Command.PAIR:
-            self.paired = True
-            resp = Packet(DeviceId.ES_BLE, DeviceId.PC, Command.PAIR, 1)
-            resp_frame = resp.pack()
-            if self.legacy:
-                wire = LegacyCodec.encrypt(resp_frame)
+            self.pair_requests += 1
+            pressed = self.button_after is not None and self.pair_requests >= self.button_after
+            if self.legacy or self.paired or pressed:
+                self.paired = True
+                if (
+                    not self.legacy
+                    and not self.was_paired_at_start
+                    and self.confirm_style == "ping"
+                    and pressed
+                    and not self._ping_confirmed
+                ):
+                    # Scooter confirms with a fresh PING-1 (once!) and switches
+                    # to the app key, as documented in miauth's state machine.
+                    self._ping_confirmed = True
+                    resp = Packet(DeviceId.ES_BLE, DeviceId.PC, Command.PING, 1)
+                    resp_frame = resp.pack()
+                    wire = self._crypto.encrypt(resp_frame)
+                    await self.notify_callback(None, bytearray(wire))
+                    self._crypto.set_app_data(self._app_key)
+                    return
+                resp = Packet(DeviceId.ES_BLE, DeviceId.PC, Command.PAIR, 1)
+                resp_frame = resp.pack()
+                if self.legacy:
+                    wire = LegacyCodec.encrypt(resp_frame)
+                else:
+                    wire = self._crypto.encrypt(resp_frame)
             else:
-                wire = self._crypto.encrypt(resp_frame)
+                # Button not pressed yet: no answer at all.
+                return
         else:
             return
         if packet.command == Command.INIT:
@@ -263,6 +291,8 @@ class FakeBleakClient:
         await self.notify_callback(None, bytearray(wire))
 
     paired = False
+    was_paired_at_start = False
+    _ping_confirmed = False
     _crypto: Any = None
     _ble_key = b"\x01" * 16
     _app_key = b"\x00" * 16
@@ -275,6 +305,7 @@ def make_client_with_fake(legacy: bool, name: str = "NBScooter") -> tuple[Ninebo
     fake = FakeBleakClient()
     fake.legacy = legacy
     fake.paired = True  # PING is answered with data_index=1 (already paired)
+    fake.was_paired_at_start = True
     crypto = NbCrypto()
     # The crypto key is derived from the BLE device name, so the fake must use
     # exactly the name the client will see on the device.
@@ -306,6 +337,36 @@ class TestHandshake:
         device = type("BLEDevice", (), {"name": "NBScooter", "address": "AA:BB:CC:DD:EE:FF"})()
         await client.connect(device)  # type: ignore[arg-type]
         assert client.legacy is True
+        assert fake.paired
+        await client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_unpaired_button_confirm_pair_style(self) -> None:
+        """Scooter answers PAIR-1 after the button press and keeps the BLE key
+        (the flow observed on the live 0x434E scooter)."""
+        client, fake = make_client_with_fake(legacy=False)
+        fake.paired = False
+        fake.was_paired_at_start = False
+        fake.confirm_style = "pair"
+        fake.button_after = 2
+        device = type("BLEDevice", (), {"name": "NBScooter", "address": "AA:BB:CC:DD:EE:FF"})()
+        await client.connect(device)  # type: ignore[arg-type]
+        assert client.legacy is False
+        assert fake.paired
+        await client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_unpaired_button_confirm_ping_style(self) -> None:
+        """Scooter confirms with a fresh PING-1 and both sides switch to the
+        app key (the flow documented in miauth's state machine)."""
+        client, fake = make_client_with_fake(legacy=False)
+        fake.paired = False
+        fake.was_paired_at_start = False
+        fake.confirm_style = "ping"
+        fake.button_after = 2
+        device = type("BLEDevice", (), {"name": "NBScooter", "address": "AA:BB:CC:DD:EE:FF"})()
+        await client.connect(device)  # type: ignore[arg-type]
+        assert client.legacy is False
         assert fake.paired
         await client.disconnect()
 
