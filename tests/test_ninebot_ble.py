@@ -98,6 +98,25 @@ class TestSerialParser:
     def test_es4_black(self) -> None:
         assert str(SerialParser("N2GSX1839C0123")) == "Ninebot ES4 (Black)"
 
+    def test_e3_family_live_serial(self) -> None:
+        """1TE = x3-gen E3 family; verified against a live E3 Pro (2025-04 build)."""
+        parsed = SerialParser("1TEFE2517C0419")
+        assert parsed.product_series == SerialParser.ProductSeries.E3
+        assert str(parsed) == "Ninebot E3 / E3 Pro"
+        assert parsed.production_date.year == 2025
+        assert parsed.production_date.isocalendar()[1] == 17
+
+    def test_e3_unknown_variant_letter_falls_back_to_family(self) -> None:
+        """Variant letters of the x3 generation are not publicly mapped yet."""
+        parsed = SerialParser("1TEAB2517C0419")
+        assert str(parsed) == "Ninebot E3 / E3 Pro"
+
+    def test_g3_family(self) -> None:
+        """1CG = x3-gen Max G3 family (unlock guides use 1CGA/1CGC serials)."""
+        parsed = SerialParser("1CGAD2315C0123")
+        assert parsed.product_series == SerialParser.ProductSeries.G3
+        assert str(parsed) == "Ninebot Max G3"
+
     def test_es2_silver(self) -> None:
         assert str(SerialParser("N2GTX1939C0123")) == "Ninebot ES2 (Silver)"
 

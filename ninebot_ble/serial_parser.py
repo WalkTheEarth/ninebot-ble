@@ -34,6 +34,11 @@ class SerialParser:
         AUDI_EKS = "NTG"  # Audi EKS (G30D)
         ES3_PLUS = "N6G"  # ES3 Plus (Costco)
         F = "N5G"  # F-series
+        E3 = "1TE"  # x3-gen E3 / E3 Pro family
+        G3 = "1CG"  # x3-gen Max G3 family
+
+    # Families whose fallback display is a bare name (no "-series" suffix).
+    BARE_NAME_SERIES = {"E3", "G3"}
 
     SERIES_NAMES = {
         ProductSeries.E_ES: "E/ES",
@@ -46,6 +51,8 @@ class SerialParser:
         ProductSeries.AUDI_EKS: "Audi EKS G30D",
         ProductSeries.ES3_PLUS: "ES3 Plus",
         ProductSeries.F: "F",
+        ProductSeries.E3: "E3 / E3 Pro",
+        ProductSeries.G3: "Max G3",
     }
 
     PRODUCT_VERSION_MAPPING = {
@@ -101,6 +108,11 @@ class SerialParser:
         ProductSeries.ES3_PLUS: {
             "A": "ES3 Plus (Costco)",
         },
+        # x3 generation: the 4th char is a variant/region letter, but the
+        # letters are not publicly documented yet. Leave the mapping empty so
+        # unknown letters degrade to the family name via product_version.
+        ProductSeries.E3: {},
+        ProductSeries.G3: {},
         ProductSeries.F: {
             "A": "F20",
             "B": "F20D",
@@ -151,7 +163,10 @@ class SerialParser:
         if self._product_version is not None:
             return self._product_version
         if self.product_series is not None:
-            return f"{self.SERIES_NAMES.get(self.product_series, str(self.product_series))}-series"
+            name = self.SERIES_NAMES.get(self.product_series, str(self.product_series))
+            if self.product_series.name in self.BARE_NAME_SERIES:
+                return name
+            return f"{name}-series"
         return f"{self._raw_series}-series"
 
     def __str__(self) -> str:
