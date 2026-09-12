@@ -9,6 +9,7 @@ from sensor_state_data import SensorUpdate
 from .register import BmsIdx, CtrlIdx, get_register_desc, iter_register
 from .serial_parser import SerialParser
 from .transport import NinebotClient
+from .util import is_scooter_advertisement
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class NinebotBleSensor(BluetoothData):
         Override.
         """
         self._start_update(data)
-        return data.manufacturer_id == 16974
+        return is_scooter_advertisement(data.name, dict(data.manufacturer_data))
 
     def _start_update(self, service_info: BluetoothServiceInfo) -> None:
         """Update from BLE advertisement data.

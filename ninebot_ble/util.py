@@ -6,9 +6,25 @@ from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
-from .const import NINEBOT_MANUFACTURER_ID
+from .const import NINEBOT_MANUFACTURER_IDS
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def is_scooter_advertisement(name: str | None, manufacturer_data: dict[int, bytes]) -> bool:
+    """Heuristic for recognizing a Ninebot scooter advertisement.
+
+    Older generations advertise with manufacturer id 0x424E, newer ones with
+    0x434E and a serial-style local name (e.g. ``1TEFE2517C0419``). Some
+    models skip manufacturer data entirely and only expose the Nordic UART
+    service, so also match the serial-style name pattern.
+    """
+    if any(mid in manufacturer_data for mid in NINEBOT_MANUFACTURER_IDS):
+        return True
+    if name and len(name) in (14, 15) and name[0].isdigit() and name[1].isalpha() and name[1].isupper():
+        # Serial-style broadcast name, e.g. ``1TEFE2517C0419``.
+        return True
+    return False
 
 
 async def async_scooter_scan() -> tuple[BLEDevice, AdvertisementData]:
@@ -25,7 +41,7 @@ async def async_scooter_scan() -> tuple[BLEDevice, AdvertisementData]:
             while time.time() < deadline:
                 try:
                     dev, adv = scan_queue.get_nowait()
-                    if NINEBOT_MANUFACTURER_ID in adv.manufacturer_data:
+                    if is_scooter_advertisement(dev.name or adv.local_name, adv.manufacturer_data):
                         return dev, adv
                 except asyncio.QueueEmpty:
                     await asyncio.sleep(0.1)

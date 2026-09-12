@@ -23,6 +23,7 @@ NORDIC_UART_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NORDIC_UART_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 INIT_ACK_PAYLOAD_LEN = 24  # 16-byte BLE key + serial
+PAIRING_TIMEOUT = 60.0  # seconds to wait for the user to press the power button
 
 
 class Command(enum.Enum):
@@ -224,9 +225,16 @@ class NinebotClient:
         # Ping
         resp = await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PING, 0, self.app_key))
         if resp.data_index == 0:
-            # Zero (0) indicates we are not paired yet.
+            # Zero (0) indicates we are not paired yet. The scooter stays in
+            # this state until the user presses its power button.
+            _LOGGER.info(
+                "Scooter is not paired yet: press the power button on the "
+                "scooter once to confirm pairing (waiting up to %d s) ...",
+                int(PAIRING_TIMEOUT),
+            )
             resp = None
-            while resp is None:
+            deadline = time.time() + PAIRING_TIMEOUT
+            while resp is None and time.time() < deadline:
                 await asyncio.sleep(1.0)
                 # Sending pair request here seem to pair the device. Unclear why.
                 await self.send(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))
@@ -235,8 +243,6 @@ class NinebotClient:
                 except TimeoutError:
                     pass
                 if resp is None:
-                    # If we get here, the button on the scooter need to be pressed.
-                    _LOGGER.info("Please press power button on scooter!")
                     continue
                 if resp.command == Command.PING and resp.data_index == 1:
                     self.crypto.set_app_data(self.app_key)
@@ -244,6 +250,13 @@ class NinebotClient:
                 if resp.command == Command.PAIR and resp.data_index == 1:
                     break
                 resp = None
+            if resp is None:
+                await self.disconnect()
+                raise TimeoutError(
+                    "Scooter did not confirm pairing within "
+                    f"{int(PAIRING_TIMEOUT)} s. Press the power button on the "
+                    "scooter once right after connecting and try again."
+                )
 
         # Pair
         await self.request(Packet(DeviceId.PC, DeviceId.ES_BLE, Command.PAIR, 0, received_serial))

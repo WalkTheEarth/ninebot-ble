@@ -134,6 +134,31 @@ class TestSerialParser:
                 assert str(parsed).startswith("Ninebot")
 
 
+class TestScooterDetection:
+    def test_classic_manufacturer_id(self) -> None:
+        from ninebot_ble.util import is_scooter_advertisement
+
+        assert is_scooter_advertisement("NBScooter", {0x424E: b""})
+
+    def test_newer_generation_manufacturer_id(self) -> None:
+        """Newer scooters advertise 0x434E with a serial-style name."""
+        from ninebot_ble.util import is_scooter_advertisement
+
+        assert is_scooter_advertisement("1TEFE2517C0419", {0x434E: bytes.fromhex("0105020000f7")})
+
+    def test_serial_style_name_without_manufacturer_data(self) -> None:
+        from ninebot_ble.util import is_scooter_advertisement
+
+        assert is_scooter_advertisement("1TEFE2517C0419", {})
+
+    def test_unrelated_device_rejected(self) -> None:
+        from ninebot_ble.util import is_scooter_advertisement
+
+        assert not is_scooter_advertisement("Washer", {})
+        assert not is_scooter_advertisement("[TV] Samsung", {})
+        assert not is_scooter_advertisement(None, {})
+
+
 class TestRegisters:
     def test_register_indices_unique_in_api(self) -> None:
         """The same CtrlIdx must not be exported twice (NB_POWER regression)."""
